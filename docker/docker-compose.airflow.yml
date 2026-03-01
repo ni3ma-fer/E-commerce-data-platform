@@ -1,0 +1,54 @@
+# docker/docker-compose.airflow.yml
+version: '3.8'
+ 
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ../airflow/dags:/opt/airflow/dags
+    - ../airflow/logs:/opt/airflow/logs
+    - ../airflow/plugins:/opt/airflow/plugins
+    - ../.env:/opt/airflow/.env
+  depends_on:
+    postgres:
+      condition: service_healthy
+ 
+services:
+  postgres:
+    image: postgres:15
+    container_name: kivendtout-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'airflow']
+      interval: 10s
+      retries: 5
+ 
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: kivendtout-airflow-web
+    command: webserver
+    ports:
+      - '8080:8080'
+    healthcheck:
+      test: ['CMD', 'curl', '--fail', 'http://localhost:8080/health']
+      interval: 30s
+ 
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: kivendtout-airflow-scheduler
+    command: scheduler
+ 
+  airflow-init:
+    <<: *airflow-common
+    container_name: kivendtout-airflow-init
+    command: bash -c "airflow db init && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@kivendtout.fr"
