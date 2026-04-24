@@ -1,26 +1,25 @@
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.pyc
 .venv/
-*.egg-info/ 
- 
+*.egg-info/
+
 # Secrets
 .env
 *.pem
 *.key
 secrets/
- 
-# Données locales (ne jamais commit des données)
+
+# Donnees locales
 data/
 *.parquet
 *.csv
- 
+*.duckdb
+
 # dbt
 dbt/target/
 dbt/dbt_packages/
 dbt/logs/
- 
+
 # Airflow
 airflow/logs/
-EOF

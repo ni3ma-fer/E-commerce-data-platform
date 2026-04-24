@@ -1,0 +1,43 @@
+# dbt/models/gold/_gold_sources.yml
+# dbt/models/gold/_gold_sources.yml
+version: 2
+ 
+sources:
+  - name: silver
+    description: "Tables Silver nettoyées et pseudonymisées (Presidio RGPD)"
+    database: hive_metastore
+    schema: silver
+    tables:
+      - name: silver_payments
+        description: "Paiements nettoyés avec features ML et labels fraude"
+        freshness:
+          warn_after:  {count: 26, period: hour}
+          error_after: {count: 50, period: hour}
+        loaded_at_field: silver_loaded_at
+        columns:
+          - name: transaction_id
+            tests: [not_null, unique]
+          - name: amount_eur
+            tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 0.01
+ 
+      - name: silver_sessions
+        description: "Sessions clickstream reconstituées"
+        freshness:
+          warn_after: {count: 26, period: hour}
+        loaded_at_field: silver_loaded_at
+ 
+      - name: silver_crm
+        description: "Données CRM pseudonymisées (PII hashées par Presidio)"
+        columns:
+          - name: user_id
+            tests: [not_null, unique]
+          # Vérification RGPD : email en clair ne doit PAS exister en Silver
+          - name: email
+            tests:
+              - dbt_utils.expression_is_true:
+                  expression: "email IS NULL"
+                  name: email_must_be_null_in_silver
+

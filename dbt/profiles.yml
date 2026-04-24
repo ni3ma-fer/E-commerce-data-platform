@@ -1,0 +1,10 @@
+kivendtout:
+  target: dev_local
+  outputs:
+    dev_local:
+      type: duckdb
+      path: 'kivendtout_local.duckdb'
+      # dbt va lire les fichiers Delta que ton Spark local a générés !
+      extensions:
+        - delta
+        - parquet

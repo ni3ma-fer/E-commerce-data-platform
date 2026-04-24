@@ -1,0 +1,265 @@
+# =============================================================================
+# dbt/models/silver/_silver_sources.yml
+# KiVendTout — Déclaration des Sources Bronze (v2)
+# =============================================================================
+#
+# MISES À JOUR v2 :
+# ─────────────────────────────────────────────────────────────────────────────
+# • bronze.payments : Ajout des colonnes KYC (user_is_minor, user_kyc_status,
+#   user_age) et fraude (fraud_type, fraud_score_label, blocked, etc.)
+#   générées par les producteurs Kafka v2 (shared_data_pool).
+#
+# • bronze.clickstream : Ajout des colonnes de session enrichies
+#   (is_adult_product, cart_value_eur, duration_ms).
+#
+# • Freshness : configurée sur ingested_at pour détecter les pannes
+#   du pipeline Kafka / Spark Streaming.
+#
+# NOTE : _silver_sources.yml déclare uniquement la structure Bronze.
+#        Les colonnes calculées en dbt (window functions, scores) sont
+#        documentées dans _silver_models.yml.
+# =============================================================================
+
+version: 2
+
+sources:
+
+  - name: bronze
+    description: >
+      Couche Bronze — données brutes depuis Kafka Streaming et Airflow Batch.
+      Schéma Databricks : bronze (Unity Catalog : hive_metastore.bronze).
+      Toutes les tables sont partitionnées par year/month/day.
+    database: hive_metastore
+    schema: bronze
+
+    tables:
+
+      # ─────────────────────────────────────────────────────────────────────
+      # bronze.payments
+      # ─────────────────────────────────────────────────────────────────────
+      - name: payments
+        description: >
+          Tentatives de paiement en temps réel depuis Kafka (topic payments-raw).
+          Inclut les transactions légitimes ET frauduleuses (ground truth ML).
+          PII pseudonymisées par Presidio avant écriture en Silver.
+        freshness:
+          # Alerte si pas de nouveaux paiements depuis 2h (pipeline Kafka HS ?)
+          warn_after:  {count: 2,  period: hour}
+          error_after: {count: 6,  period: hour}
+        loaded_at_field: ingested_at
+
+        columns:
+          - name: transaction_id
+            description: 'UUID unique — clé primaire Bronze'
+            tests:
+              - not_null
+              - unique
+
+          - name: user_id
+            description: 'Identifiant utilisateur (format USR-XXXXXX)'
+            tests:
+              - not_null
+
+          - name: amount
+            description: 'Montant brut en devise d'origine (peut être négatif en Bronze)'
+            tests:
+              - not_null
+
+          - name: currency
+            description: 'Code devise brut (sera normalisé en Silver)'
+
+          - name: billing_country
+            description: 'Pays de facturation brut (sera normalisé ISO 3166 en Silver)'
+
+          - name: shipping_country
+            description: 'Pays de livraison brut'
+
+          - name: user_kyc_status
+            description: >
+              Statut KYC depuis shared_data_pool (déterministe par user_id).
+              Valeurs : 'verified' | 'pending' | 'none' | 'rejected' | 'expired'
+
+          - name: user_is_minor
+            description: 'TRUE si âge < 18 ans — critique pour contrôle CAT-Adult'
+
+          - name: user_age
+            description: 'Âge en années entières (déterministe depuis shared_data_pool)'
+
+          - name: fraud_type
+            description: >
+              Type de fraude simulé par payment_producer.py v2 :
+              'adult_minor' | 'velocity_attack' | 'geo_mismatch' |
+              'new_account_high_amount' | 'fraud_ring' | NULL (légitime)
+
+          - name: fraud_score_label
+            description: 'Ground truth ML du score de fraude (0.0–1.0)'
+
+          - name: blocked
+            description: 'TRUE si la transaction a été bloquée par la logique producteur'
+
+          - name: reject_reason
+            description: 'Raison du rejet si blocked=TRUE'
+
+          - name: geo_distance_km
+            description: 'Distance IP ↔ livraison en km (calculée par le producteur)'
+
+          - name: velocity_count_5min
+            description: 'Nb de tentatives dans les 5 dernières minutes (same user_id)'
+
+          - name: ip_address
+            description: 'IP brute — sera pseudonymisée par Presidio'
+
+          - name: ip_country_code
+            description: 'Code pays de l IP (MaxMind GeoLite2)'
+
+          - name: ingested_at
+            description: 'Timestamp d'ingestion Spark Streaming → Bronze'
+            tests:
+              - not_null
+
+      # ─────────────────────────────────────────────────────────────────────
+      # bronze.clickstream
+      # ─────────────────────────────────────────────────────────────────────
+      - name: clickstream
+        description: >
+          Événements clickstream des sessions utilisateurs (Kafka topic clickstream-raw).
+          Inclut les événements standard ET les événements KYC
+          (id_verification_started, id_verification_failed).
+        freshness:
+          warn_after:  {count: 1,  period: hour}
+          error_after: {count: 4,  period: hour}
+        loaded_at_field: ingested_at
+
+        columns:
+          - name: event_id
+            description: 'UUID unique de l'événement — clé primaire Bronze'
+            tests:
+              - not_null
+              - unique
+
+          - name: session_id
+            description: 'UUID de session — regroupe les events d'une même visite'
+            tests:
+              - not_null
+
+          - name: user_id
+            description: 'Identifiant utilisateur'
+            tests:
+              - not_null
+
+          - name: event_type
+            description: >
+              Type d'événement clickstream v2 (élargi depuis le producteur v2) :
+              page_view, product_view, add_to_cart, remove_from_cart,
+              checkout_start, checkout_payment, order_confirmation,
+              id_verification_started, id_verification_failed,
+              id_verification_completed, add_to_cart_blocked
+            tests:
+              - not_null
+              - accepted_values:
+                  values:
+                    - page_view
+                    - product_view
+                    - add_to_cart
+                    - remove_from_cart
+                    - checkout_start
+                    - checkout_address
+                    - checkout_payment
+                    - order_confirmation
+                    - payment_failed
+                    - wishlist_add
+                    - search_results
+                    - category_browse
+                    - homepage
+                    - cart_view
+                    - id_verification_started
+                    - id_verification_failed
+                    - id_verification_completed
+                    - add_to_cart_blocked
+                    # Tolérance : autres événements futurs sans casser la Bronze
+                  config:
+                    severity: warn    # WARN (pas ERROR) — nouveaux types tolérés
+
+          - name: timestamp
+            description: 'Timestamp ISO 8601 de l'événement (string brut Bronze)'
+            tests:
+              - not_null
+
+          - name: is_adult_product
+            description: 'TRUE si l'événement concerne un produit CAT-Adult'
+
+          - name: cart_value_eur
+            description: 'Valeur du panier au moment de l'événement'
+
+          - name: duration_ms
+            description: 'Durée passée sur la page en millisecondes'
+
+          - name: scroll_depth_pct
+            description: 'Profondeur de scroll en pourcentage (0-100)'
+
+          - name: user_kyc_status
+            description: 'Statut KYC de l'utilisateur au moment de l'événement'
+
+          - name: user_is_minor
+            description: 'TRUE si l'utilisateur est mineur'
+
+          - name: ingested_at
+            description: 'Timestamp d'ingestion Spark Streaming → Bronze'
+            tests:
+              - not_null
+
+      # ─────────────────────────────────────────────────────────────────────
+      # bronze.crm
+      # ─────────────────────────────────────────────────────────────────────
+      - name: crm
+        description: >
+          Export quotidien de la base CRM (DAG Airflow dag_bronze_crm.py).
+          Données issues de shared_data_pool — cohérence user_id garantie
+          avec les sources payments et clickstream.
+        freshness:
+          # Export CRM à 02h00 UTC → alerte si pas de données après 05h00
+          warn_after:  {count: 25, period: hour}
+          error_after: {count: 48, period: hour}
+        loaded_at_field: ingested_at
+
+        columns:
+          - name: user_id
+            description: 'Identifiant utilisateur (PK Bronze CRM)'
+            tests:
+              - not_null
+              - unique
+
+          - name: birth_date
+            description: 'Date de naissance — source OCR pipeline ML'
+
+          - name: age
+            description: 'Âge calculé en années'
+
+          - name: id_verification_status
+            description: >
+              Statut KYC : 'verified' | 'pending' | 'none' | 'rejected' | 'expired'
+
+          - name: id_document_image_path
+            description: >
+              Chemin S3/ADLS de l'image CNI pour le pipeline OCR Tesseract.
+              NULL si kyc_status = 'none' ou 'expired'.
+
+          - name: customer_segment
+            description: "'vip' | 'gold' | 'silver' | 'bronze' | 'new'"
+
+          - name: total_spent_eur
+            description: 'Total historique des achats en EUR'
+
+          - name: newsletter_optin
+            description: 'TRUE si opt-in newsletter RGPD'
+
+          - name: gdpr_consent_date
+            description: 'Date de consentement RGPD (Art.7) — toujours >= registration_date'
+            tests:
+              - not_null:
+                  name: gdpr_consent_must_not_be_null
+
+          - name: ingested_at
+            description: 'Timestamp d'upload Azure ADLS (dag_bronze_crm.py)'
+            tests:
+              - not_null

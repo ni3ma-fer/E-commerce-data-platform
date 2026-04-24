@@ -1,0 +1,417 @@
+# =============================================================================
+# dbt/models/silver/_silver_models.yml
+# KiVendTout — Documentation & Tests des modèles Silver (v2)
+# =============================================================================
+#
+# MISES À JOUR v2 :
+# ─────────────────────────────────────────────────────────────────────────────
+# silver_payments.sql :
+#   • Ajout des colonnes issues des window functions SQL :
+#     user_txn_count_30d, user_avg_amount_30d, user_amount_stddev_30d,
+#     amount_vs_avg_ratio, is_first_transaction, user_distinct_countries_30d,
+#     user_distinct_merchants_30d
+#   • Ajout des colonnes : ip_geo_mismatch, user_age, user_is_minor
+#
+# silver_sessions.sql :
+#   • Ajout : engagement_score, avg_scroll_depth, product_views,
+#     unique_products_viewed, unique_categories_viewed,
+#     contains_adult_products, max_cart_value_eur
+#   • Tests mis à jour sur session_duration_seconds (min >= 2)
+# =============================================================================
+
+version: 2
+
+models:
+
+  # ---------------------------------------------------------------------------
+  # silver_payments
+  # ---------------------------------------------------------------------------
+  - name: silver_payments
+    description: >
+      Table Silver des paiements — données nettoyées, typées, avec features
+      comportementales calculées en SQL (window functions 30 jours glissants)
+      pour le modèle XGBoost de détection de fraude.
+      PII pseudonymisées par Microsoft Presidio en amont (job Spark).
+      Matérialisée en mode incrémental avec stratégie MERGE sur transaction_id.
+
+    config:
+      meta:
+        owner: data-team
+        tier: silver
+        sla_hours: 2
+
+    columns:
+
+      # ── Clés ────────────────────────────────────────────────────────────────
+      - name: transaction_id
+        description: 'UUID unique de chaque transaction (clé primaire Silver)'
+        tests:
+          - not_null
+          - unique
+
+      - name: user_id
+        description: 'Identifiant utilisateur (format USR-XXXXXX)'
+        tests:
+          - not_null
+
+      - name: merchant_id
+        description: 'Identifiant marchand (format MERCH-XXXX)'
+
+      - name: order_id
+        description: 'Identifiant commande associée (format ORD-XXXXXXX)'
+
+      # ── Données financières ─────────────────────────────────────────────────
+      - name: amount_eur
+        description: 'Montant en EUR, toujours positif, arrondi 2 décimales'
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0.01
+              max_value: 99999
+
+      - name: currency_code
+        description: 'Code devise ISO 4217 normalisé en majuscules'
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['EUR', 'USD', 'GBP', 'CHF', 'JPY', 'CAD', 'AUD']
+
+      # ── Temporalité ────────────────────────────────────────────────────────
+      - name: event_timestamp
+        description: 'Timestamp de la transaction (depuis le string Bronze)'
+        tests:
+          - not_null
+
+      - name: event_date
+        description: 'Date de la transaction (partitionnement Silver)'
+        tests:
+          - not_null
+
+      - name: event_hour
+        description: 'Heure de la transaction (0-23) — feature temporelle ML'
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 23
+
+      - name: time_of_day
+        description: "Tranche horaire : 'night' | 'morning' | 'afternoon' | 'evening'"
+        tests:
+          - accepted_values:
+              values: ['night', 'morning', 'afternoon', 'evening']
+
+      # ── Géographie ─────────────────────────────────────────────────────────
+      - name: billing_country_iso
+        description: 'Pays de facturation ISO 3166-1 alpha-2 (ex: FR, DE)'
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "LENGTH(billing_country_iso) = 2"
+              name: billing_country_must_be_2_chars
+
+      - name: shipping_country_iso
+        description: 'Pays de livraison ISO 3166-1 alpha-2'
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "LENGTH(shipping_country_iso) = 2"
+              name: shipping_country_must_be_2_chars
+
+      - name: is_cross_border
+        description: >
+          TRUE si billing_country_iso ≠ shipping_country_iso.
+          Signal de fraude potentielle (FR → NG par exemple).
+
+      - name: ip_geo_mismatch
+        description: >
+          TRUE si le pays de l'IP (ip_country_code) ≠ billing_country_iso.
+          Feature critique pour XGBoost : incohérence géographique IP/carte.
+
+      - name: geo_distance_km
+        description: 'Distance géographique IP ↔ adresse de livraison (MaxMind)'
+
+      # ── KYC ────────────────────────────────────────────────────────────────
+      - name: user_kyc_status
+        description: "Statut KYC : 'verified' | 'pending' | 'none' | 'rejected' | 'expired'"
+        tests:
+          - accepted_values:
+              values: ['verified', 'pending', 'none', 'rejected', 'expired']
+              # NULL autorisé pour les anciens comptes sans KYC
+              config:
+                where: "user_kyc_status IS NOT NULL"
+
+      - name: user_is_minor
+        description: 'TRUE si âge calculé < 18 ans — contrôle accès articles adultes'
+
+      - name: user_age
+        description: 'Âge en années entières (depuis shared_data_pool)'
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 120
+              config:
+                where: "user_age IS NOT NULL"
+
+      # ── Features ML (Window Functions SQL — NOUVEAU v2) ────────────────────
+      - name: user_txn_count_30d
+        description: >
+          Nombre de transactions de l'utilisateur dans les 30 derniers jours
+          (fenêtre glissante RANGE BASED sur event_timestamp).
+          Feature de vélocité : signal de carding si > 10 en 30 jours.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1    # Au moins 1 (la transaction courante)
+
+      - name: user_avg_amount_30d
+        description: >
+          Montant moyen des transactions de l'utilisateur sur 30 jours.
+          Baseline comportementale pour le ratio amount_vs_avg_ratio.
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0.01
+              config:
+                where: "user_avg_amount_30d IS NOT NULL"
+
+      - name: user_amount_stddev_30d
+        description: >
+          Écart-type du montant sur 30 jours.
+          Mesure la volatilité comportementale (NULL si 1 seule transaction).
+
+      - name: amount_vs_avg_ratio
+        description: >
+          Ratio montant_courant / montant_moyen_30j.
+          > 3.0 = transaction anormalement élevée → feature XGBoost prioritaire.
+          NULL si user_avg_amount_30d = 0 (protection division par zéro).
+
+      - name: is_first_transaction
+        description: >
+          TRUE si c'est la première transaction de cet utilisateur
+          (tout historique confondu, pas seulement 30j).
+          Comptes récents + gros montants = pattern fraude fréquent.
+
+      - name: user_distinct_countries_30d
+        description: >
+          Nombre de pays de facturation distincts utilisés sur 30 jours.
+          > 3 pays = signal de fraude multi-pays.
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+
+      - name: user_distinct_merchants_30d
+        description: 'Nombre de marchands distincts sur 30 jours.'
+
+      - name: velocity_count_5min
+        description: >
+          Nombre de tentatives de paiement dans les 5 dernières minutes
+          (calculé côté Spark Streaming temps réel, transmis en Bronze).
+          Feature de vélocité ultra-courte complémentaire aux 30j.
+
+      # ── Fraude ─────────────────────────────────────────────────────────────
+      - name: fraud_type
+        description: >
+          Type de fraude simulé (NULL si transaction légitime) :
+          'adult_minor' | 'velocity_attack' | 'geo_mismatch' |
+          'new_account_high_amount' | 'fraud_ring'
+
+      - name: fraud_score_label
+        description: >
+          Score de fraude ground truth (0.0–1.0).
+          > 0.8 = fraude quasi-certaine. Sert de target pour XGBoost.
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0.0
+              max_value: 1.0
+              config:
+                where: "fraud_score_label IS NOT NULL"
+
+      - name: blocked
+        description: 'TRUE si la transaction a été bloquée par le pipeline fraude'
+
+      - name: reject_reason
+        description: "Raison de rejet si blocked=TRUE : 'fraud_detected' | 'kyc_failed' | etc."
+
+      # ── Audit ──────────────────────────────────────────────────────────────
+      - name: ingested_at
+        description: 'Timestamp d'ingestion en Bronze (depuis Kafka Streaming)'
+        tests:
+          - not_null
+
+      - name: pii_anonymized_at
+        description: 'Timestamp de pseudonymisation Presidio — RGPD Art.25'
+        tests:
+          # RGPD : Presidio DOIT avoir tourné avant l'écriture en Silver
+          - not_null:
+              name: pii_must_be_anonymized_before_silver
+
+      - name: silver_loaded_at
+        description: 'Timestamp d'écriture en Silver (CURRENT_TIMESTAMP() dbt)'
+        tests:
+          - not_null
+
+  # ---------------------------------------------------------------------------
+  # silver_sessions
+  # ---------------------------------------------------------------------------
+  - name: silver_sessions
+    description: >
+      Sessions utilisateurs reconstituées depuis le clickstream Bronze.
+      Unité d'analyse pour les KPIs de conversion et d'engagement.
+      Fenêtre de lookback 3 jours pour capturer les sessions à cheval
+      sur minuit et les events Kafka en retard.
+      Matérialisée en mode incrémental avec MERGE sur session_id.
+
+    config:
+      meta:
+        owner: data-team
+        tier: silver
+        sla_hours: 3
+
+    columns:
+
+      # ── Clés ────────────────────────────────────────────────────────────────
+      - name: session_id
+        description: 'UUID unique de la session (clé primaire Silver)'
+        tests:
+          - not_null
+          - unique
+
+      - name: user_id
+        description: 'Identifiant utilisateur de la session'
+        tests:
+          - not_null
+
+      # ── Contexte technique ─────────────────────────────────────────────────
+      - name: device_category
+        description: "Catégorie d'appareil normalisée : 'mobile' | 'tablet' | 'desktop'"
+        tests:
+          - accepted_values:
+              values: ['mobile', 'tablet', 'desktop']
+
+      - name: browser
+        description: "Navigateur normalisé : 'chrome' | 'firefox' | 'safari' | 'edge' | 'other'"
+
+      - name: traffic_source
+        description: >
+          Source de trafic normalisée :
+          'organic_search' | 'social' | 'email' | 'direct' | 'referral'
+        tests:
+          - accepted_values:
+              values: ['organic_search', 'social', 'email', 'direct', 'referral']
+
+      # ── Temporalité ────────────────────────────────────────────────────────
+      - name: session_start
+        description: 'Timestamp du premier event de la session'
+        tests:
+          - not_null
+
+      - name: session_end
+        description: 'Timestamp du dernier event de la session'
+        tests:
+          - not_null
+
+      - name: session_date
+        description: 'Date de la session (basée sur le premier event)'
+        tests:
+          - not_null
+
+      - name: session_duration_seconds
+        description: >
+          Durée de la session en secondes (session_end - session_start).
+          Minimum 2s après filtrage des bots dans cleaned_events.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 2
+
+      # ── Métriques engagement ───────────────────────────────────────────────
+      - name: total_events
+        description: 'Nombre total d'événements dans la session'
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 2
+
+      - name: page_views
+        description: "Nombre d'events de type 'page_view'"
+
+      - name: product_views
+        description: "Nombre d'events de type 'product_view' — intérêt produit"
+
+      - name: add_to_cart_count
+        description: "Nombre d'ajouts au panier dans la session"
+
+      - name: remove_from_cart_count
+        description: "Nombre de suppressions du panier (indice d'hésitation)"
+
+      - name: checkout_starts
+        description: "Nombre de fois où le checkout a été initié"
+
+      - name: wishlist_adds
+        description: "Ajouts à la wishlist (intérêt sans intention d'achat immédiat)"
+
+      - name: unique_products_viewed
+        description: 'Nombre de produits distincts consultés dans la session'
+
+      - name: unique_categories_viewed
+        description: "Nombre de catégories distinctes visitées — breadth of browsing"
+
+      - name: max_scroll_depth
+        description: 'Profondeur de scroll maximum (0-100%) dans la session'
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 100
+              config:
+                where: "max_scroll_depth IS NOT NULL"
+
+      - name: avg_scroll_depth
+        description: 'Profondeur de scroll moyenne sur tous les events de la session'
+
+      - name: avg_page_duration_seconds
+        description: 'Durée moyenne passée sur chaque page'
+
+      - name: max_cart_value_eur
+        description: 'Valeur maximale du panier atteinte dans la session'
+
+      # ── Conversion ─────────────────────────────────────────────────────────
+      - name: has_conversion
+        description: >
+          TRUE si la session contient au moins un event 'checkout_start'.
+          KPI principal de conversion (à ne pas confondre avec une commande
+          confirmée, qui nécessite un paiement réussi dans silver_payments).
+
+      # ── Pages ──────────────────────────────────────────────────────────────
+      - name: entry_page
+        description: 'Première page visitée dans la session (FIRST_VALUE window)'
+
+      - name: exit_page
+        description: 'Dernière page visitée dans la session (LAST_VALUE window)'
+
+      # ── KYC Adultes ────────────────────────────────────────────────────────
+      - name: contains_adult_products
+        description: >
+          TRUE si la session a inclus la consultation de produits CAT-Adult.
+          Utilisé pour vérifier que le contrôle KYC a bien été déclenché.
+
+      # ── Score d'engagement (NOUVEAU v2) ────────────────────────────────────
+      - name: engagement_score
+        description: >
+          Score d'engagement de la session (0.0 → 1.0) calculé en SQL :
+          0.0 = bounce (1 page), 0.2 = navigation, 0.4 = intérêt produit,
+          0.7 = ajout panier, 1.0 = checkout initié.
+          Feature pour les modèles de propension à l'achat.
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0.0
+              max_value: 1.0
+
+      # ── Audit ──────────────────────────────────────────────────────────────
+      - name: ingested_at
+        description: 'Timestamp d'ingestion du dernier event de la session en Bronze'
+        tests:
+          - not_null
+
+      - name: silver_loaded_at
+        description: 'Timestamp d'écriture en Silver'
+        tests:
+          - not_null
