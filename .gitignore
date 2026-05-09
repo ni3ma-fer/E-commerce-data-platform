@@ -10,11 +10,10 @@ __pycache__/
 *.key
 secrets/
 
-# Donnees locales
+# Données locales (ne jamais commit des données)
 data/
 *.parquet
 *.csv
-*.duckdb
 
 # dbt
 dbt/target/
@@ -23,3 +22,8 @@ dbt/logs/
 
 # Airflow
 airflow/logs/
+
+.claude/
+*.duckdb
+mlflow.db
+mlruns/
