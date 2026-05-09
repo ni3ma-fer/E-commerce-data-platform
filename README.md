@@ -307,8 +307,3 @@ FRAUD_ALERT_THRESHOLD=0.80
 | Kafka UI | http://localhost:8090 | — |
 | MLflow | http://localhost:5000 | — |
 
----
-
-## Licence
-
-Projet académique — Bloc 1 Data Engineering.
