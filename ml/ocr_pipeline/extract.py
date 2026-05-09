@@ -109,4 +109,4 @@ def extract_cni_data(image: np.ndarray, user_id: str) -> CNIResult:
         result.action_required  = "manual_review"
  
     return result
- 
+ 

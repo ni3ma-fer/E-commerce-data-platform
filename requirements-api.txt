@@ -1,0 +1,35 @@
+# requirements-api.txt — dependances de la couche API
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.1
+python-multipart==0.0.9
+
+# Auth JWT
+python-jose[cryptography]==3.3.0
+
+# Cache
+redis==5.0.4
+
+# Rate limiting
+slowapi==0.1.9
+
+# HTTP client (alertes Slack)
+httpx==0.27.0
+
+# Acces ML pipeline
+xgboost==2.0.3
+mlflow==2.13.0
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.0
+
+# OCR (si Tesseract installe sur le systeme)
+pytesseract==0.3.10
+opencv-python-headless==4.9.0.80
+Pillow==10.3.0
+
+# DuckDB (Gold/Silver local)
+duckdb==0.10.3
+
+# Utilitaires
+python-dotenv==1.0.1

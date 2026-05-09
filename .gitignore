@@ -1,8 +1,12 @@
 # Python
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*.pyo
 .venv/
 *.egg-info/
+dist/
+build/
 
 # Secrets
 .env
@@ -15,15 +19,34 @@ data/
 *.parquet
 *.csv
 
+# Logs
+logs/
+*.log
+airflow/logs/
+
 # dbt
 dbt/target/
 dbt/dbt_packages/
 dbt/logs/
+dbt/.user.yml
 
-# Airflow
-airflow/logs/
-
-.claude/
-*.duckdb
+# MLflow
 mlflow.db
 mlruns/
+
+# DuckDB
+*.duckdb
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
